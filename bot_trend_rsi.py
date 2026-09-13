@@ -207,7 +207,7 @@ def submit_order(server, keypair, counter_asset, side, amount, price):
     if side == "buy":
         tx_builder.append_manage_buy_offer_op(
             selling=counter_asset, buying=BASE_ASSET,
-            amount=str(round(amount, 7)), price=str(round(1 / limit_price, 7)),
+            amount=str(round(amount, 7)), price=str(round(limit_price, 7)),
         )
     else:
         tx_builder.append_manage_sell_offer_op(
