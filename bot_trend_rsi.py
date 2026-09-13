@@ -170,7 +170,7 @@ def discover_tradable_assets(server: Server, public_key: str) -> list:
 # --------------------------------------------------------------------------
 
 def get_mid_price(server: Server, counter_asset: Asset) -> float:
-    order_book = server.orders_book(selling=BASE_ASSET, buying=counter_asset).limit(1).call()
+    order_book = server.orderbook(selling=BASE_ASSET, buying=counter_asset).limit(1).call()
     bids = order_book.get("bids", [])
     asks = order_book.get("asks", [])
     if not bids or not asks:
