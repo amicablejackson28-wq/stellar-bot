@@ -332,7 +332,12 @@ def run_bot():
                     log.warning("No tradable (non-XLM) trustlines found yet in this account.")
 
             for pair_state in list(state.pairs.values()):
-                process_pair(server, keypair, state, pair_state)
+                try:
+                    process_pair(server, keypair, state, pair_state)
+                except BaseHorizonError as e:
+                    log.error(f"[{pair_state.asset.code}] Horizon API error: {e}")
+                except Exception as e:
+                    log.exception(f"[{pair_state.asset.code}] Unexpected error: {e}")
 
             cycle_count += 1
 
