@@ -1,0 +1,3 @@
+stellar-sdk
+flask
+gunicorn
