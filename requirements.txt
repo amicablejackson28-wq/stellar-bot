@@ -1,3 +1,4 @@
 stellar-sdk
 flask
 gunicorn
+requests
