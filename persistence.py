@@ -41,6 +41,17 @@ def is_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
 
 
+def _log_error(context: str, e: requests.RequestException):
+    """Logs the actual response body from Supabase when available — the
+    generic exception text alone (e.g. '403 Client Error: Forbidden')
+    hides the real reason PostgREST gives, which is needed to diagnose
+    auth/config issues instead of guessing."""
+    body = ""
+    if getattr(e, "response", None) is not None:
+        body = f" | response body: {e.response.text}"
+    log.error(f"Supabase {context} failed: {e}{body}")
+
+
 def _url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
 
@@ -58,7 +69,7 @@ def get_pair(asset_code: str, asset_issuer: str) -> dict | None:
         rows = resp.json()
         return rows[0] if rows else None
     except requests.RequestException as e:
-        log.error(f"Supabase get_pair failed for {asset_code}: {e}")
+        _log_error(f"get_pair({asset_code})", e)
         return None
 
 
@@ -74,7 +85,7 @@ def upsert_pair(row: dict) -> bool:
         resp.raise_for_status()
         return True
     except requests.RequestException as e:
-        log.error(f"Supabase upsert_pair failed: {e}")
+        _log_error("upsert_pair", e)
         return False
 
 
@@ -90,7 +101,7 @@ def get_daily_risk(trade_date: str) -> dict | None:
         rows = resp.json()
         return rows[0] if rows else None
     except requests.RequestException as e:
-        log.error(f"Supabase get_daily_risk failed: {e}")
+        _log_error("get_daily_risk", e)
         return None
 
 
@@ -105,7 +116,7 @@ def upsert_daily_risk(row: dict) -> bool:
         resp.raise_for_status()
         return True
     except requests.RequestException as e:
-        log.error(f"Supabase upsert_daily_risk failed: {e}")
+        _log_error("upsert_daily_risk", e)
         return False
 
 
@@ -122,7 +133,7 @@ def record_order(row: dict) -> int | None:
         rows = resp.json()
         return rows[0]["id"] if rows else None
     except requests.RequestException as e:
-        log.error(f"Supabase record_order failed: {e}")
+        _log_error("record_order", e)
         return None
 
 
@@ -134,7 +145,7 @@ def record_trade(row: dict) -> bool:
         resp.raise_for_status()
         return True
     except requests.RequestException as e:
-        log.error(f"Supabase record_trade failed: {e}")
+        _log_error("record_trade", e)
         return False
 
 
@@ -159,7 +170,7 @@ def get_known_offer_ids(asset_code: str, asset_issuer: str) -> set:
         resp.raise_for_status()
         return {row["offer_id"] for row in resp.json() if row.get("offer_id")}
     except requests.RequestException as e:
-        log.error(f"Supabase get_known_offer_ids failed: {e}")
+        _log_error("get_known_offer_ids", e)
         return set()
 
 
