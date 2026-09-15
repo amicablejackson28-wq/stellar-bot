@@ -472,7 +472,7 @@ def submit_order(server, keypair, counter_asset, side, amount, price) -> Executi
     """
     pair_label = f"XLM/{counter_asset.code}"
     tolerance = 1.002 if side == "buy" else 0.998
-  limit_price = price * tolerance
+    limit_price = price * tolerance
 
     if DRY_RUN:
         log.info(f"[DRY RUN] {side.upper()} {amount:.4f} XLM @ {price:.6f} {counter_asset.code}")
