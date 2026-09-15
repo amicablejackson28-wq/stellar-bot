@@ -276,7 +276,7 @@ def reconcile_pair_on_startup(server: Server, keypair, asset: Asset, balance: fl
     # ---- 1. Resting offers: only "known" if WE persisted their offer_id ----
     known_offer_ids = persistence.get_known_offer_ids(asset.code, asset.issuer)
     try:
-        offers = server.offers().account(keypair.public_key).call()
+        offers = server.offers().for_seller(keypair.public_key).call()
         for rec in offers.get("_embedded", {}).get("records", []):
             selling, buying = rec.get("selling", {}), rec.get("buying", {})
             is_this_pair = (
@@ -523,7 +523,7 @@ def submit_order(server, keypair, counter_asset, side, amount, price) -> Executi
     sell_asset = counter_asset if side == "buy" else BASE_ASSET
     buy_asset = BASE_ASSET if side == "buy" else counter_asset
     try:
-        offers = (server.offers().account(keypair.public_key)
+        offers = (server.offers().for_seller(keypair.public_key)
                   .for_selling(sell_asset).for_buying(buy_asset).call())
         offer_records = offers.get("_embedded", {}).get("records", [])
         if offer_records:
@@ -678,7 +678,7 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState):
             _persist_daily_risk(state)
             log.info(f"[{label}] SELL ({reason}, RSI={rsi:.1f}) — sold {filled:.4f}. PnL: {pnl:.2f}")
         else:
-            log.info(f"[{label}] SELL signal fired but order did not fill.")
+            log.info(f"[{label}] SELL signal fired but order did not fill. Still holding position.")
 
 
 def run_bot():
