@@ -51,6 +51,7 @@ SETUP
 
 import os
 import time
+import socket
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -60,6 +61,8 @@ from stellar_sdk import Server, Keypair, Asset, TransactionBuilder, Network
 from stellar_sdk.exceptions import BaseHorizonError
 
 import persistence
+
+socket.setdefaulttimeout(30)
 
 # --------------------------------------------------------------------------
 # CONFIG
