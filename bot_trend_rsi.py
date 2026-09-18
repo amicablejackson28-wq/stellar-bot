@@ -880,5 +880,14 @@ def run_bot():
 
             cycle_count += 1
 
-        except BaseHorizonError
+        except BaseHorizonError as e:
+            log.error(f"Horizon API error: {e}")
+        except Exception as e:
+            log.exception(f"Unexpected error: {e}")
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    run_bot()
 
