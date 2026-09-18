@@ -464,4 +464,421 @@ def reset_daily_pnl_if_new_day(state: BotState):
 
 
 def _cancel_offer(server, keypair, counter_asset, side, offer_id, price):
+    """Cancel a resting (unfilled or partially filled) offer by setting amount to 0."""
+    account = server.load_account(keypair.public_key)
+    tx_builder = TransactionBuilder(
+        source_account=account,
+        network_passphrase=NETWORK_PASSPHRASES[NETWORK],
+        base_fee=server.fetch_base_fee(),
+    )
+    if side == "buy":
+        tx_builder.append_manage_buy_offer_op(
+            selling=counter_asset, buying=BASE_ASSET,
+            amount="0", price=str(round(price, 7)), offer_id=int(offer_id),
+        )
+    else:
+        tx_builder.append_manage_sell_offer_op(
+            selling=BASE_ASSET, buying=counter_asset,
+            amount="0", price=str(round(price, 7)), offer_id=int(offer_id),
+        )
+    tx = tx_builder.set_timeout(30).build()
+    tx.sign(keypair)
+    try:
+        server.submit_transaction(tx)
+        log.info(f"Cancelled unfilled remainder of offer {offer_id}.")
+    except BaseHorizonError as e:
+        log.error(f"Failed to cancel offer {offer_id}: {e}")
+
+
+class FillStatus:
+    FILLED = "FILLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass
+class ExecutionRecord:
     """
+    Full audit record for one submitted order. Anything we can't actually
+    verify is left as None rather than backfilled with an approximation —
+    a None here is a known gap, not a silent guess.
+    """
+    transaction_hash: str | None
+    pair: str
+    side: str
+    requested_amount: float
+    limit_price: float
+    offer_id: str | None = None
+    actual_filled_amount: float = 0.0
+    actual_execution_price: float | None = None  # not yet computed — see note below
+    actual_fees: float | None = None              # not yet computed — see note below
+    remaining_amount: float = 0.0
+    verification_status: str = FillStatus.UNCERTAIN
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+def submit_order(server, keypair, counter_asset, side, amount, price) -> ExecutionRecord:
+    """
+    Submits an order and returns a full ExecutionRecord.
+
+    IMPORTANT: append_manage_*_offer_op places a resting limit order on the
+    SDEX orderbook. Successful submission does NOT mean it filled — it may
+    partially fill, or not fill at all, and sit on the books. This function
+    checks what actually happened and cancels any unfilled remainder so we
+    never leave a stray order unmanaged between polling cycles.
+
+    KNOWN GAP (not yet closed): fill detection below infers "fully filled"
+    from the absence of a resting offer on this exact selling/buying pair.
+    Stellar's protocol guarantees a nonzero manage-offer operation either
+    deletes (fully matched) or rests with a remainder — there's no third
+    case — so that part is sound. What's NOT independently proven is that
+    the absence we observe corresponds to *this* transaction specifically,
+    rather than some other resting offer on the same pair. Today that gap
+    is closed by a design invariant (this bot never has more than one
+    resting order per pair at a time), not by direct transaction-level
+    correlation. Closing it properly means tying the check to this
+    transaction's own offer_id via operation/effect records, which needs
+    an SDK call this codebase hasn't verified yet — so it's left as a
+    documented gap rather than a guessed implementation.
+
+    actual_execution_price and actual_fees are similarly left unpopulated
+    (None) for the same reason. Callers fall back to the submitted
+    mid-price for PnL, which is an approximation, not a verified price.
+    """
+    pair_label = f"XLM/{counter_asset.code}"
+    tolerance = 1.002 if side == "buy" else 0.998
+    limit_price = price * tolerance
+
+    if DRY_RUN:
+        log.info(f"[DRY RUN] {side.upper()} {amount:.4f} XLM @ {price:.6f} {counter_asset.code}")
+        return ExecutionRecord(
+            transaction_hash=None, pair=pair_label, side=side,
+            requested_amount=amount, limit_price=limit_price,
+            actual_filled_amount=amount, remaining_amount=0.0,
+            verification_status=FillStatus.FILLED,
+        )
+
+    account = server.load_account(keypair.public_key)
+    tx_builder = TransactionBuilder(
+        source_account=account,
+        network_passphrase=NETWORK_PASSPHRASES[NETWORK],
+        base_fee=server.fetch_base_fee(),
+    )
+
+    if side == "buy":
+        tx_builder.append_manage_buy_offer_op(
+            selling=counter_asset, buying=BASE_ASSET,
+            amount=str(round(amount, 7)), price=str(round(limit_price, 7)),
+        )
+    else:
+        tx_builder.append_manage_sell_offer_op(
+            selling=BASE_ASSET, buying=counter_asset,
+            amount=str(round(amount, 7)), price=str(round(limit_price, 7)),
+        )
+
+    tx = tx_builder.set_timeout(30).build()
+    tx.sign(keypair)
+    try:
+        response = server.submit_transaction(tx)
+        tx_hash = response["hash"]
+        log.info(f"Order submitted for {pair_label}: {tx_hash}")
+    except BaseHorizonError as e:
+        log.error(f"Order failed for {pair_label}: {e}")
+        return ExecutionRecord(
+            transaction_hash=None, pair=pair_label, side=side,
+            requested_amount=amount, limit_price=limit_price,
+            verification_status=FillStatus.UNCERTAIN,
+        )
+
+    record = ExecutionRecord(
+        transaction_hash=tx_hash, pair=pair_label, side=side,
+        requested_amount=amount, limit_price=limit_price,
+    )
+
+    sell_asset = counter_asset if side == "buy" else BASE_ASSET
+    buy_asset = BASE_ASSET if side == "buy" else counter_asset
+    try:
+        offers = (server.offers().for_seller(keypair.public_key)
+                  .for_selling(sell_asset).for_buying(buy_asset).call())
+        offer_records = offers.get("_embedded", {}).get("records", [])
+        if offer_records:
+            offer = offer_records[0]
+            remaining = float(offer.get("amount", 0))
+            filled = max(0.0, amount - remaining)
+            record.offer_id = offer.get("id")
+            record.actual_filled_amount = filled
+            record.remaining_amount = remaining
+            if remaining > 0:
+                record.verification_status = FillStatus.PARTIALLY_FILLED
+                log.warning(f"{pair_label} order partially filled "
+                            f"({filled:.4f}/{amount:.4f}); cancelling remainder.")
+                _cancel_offer(server, keypair, counter_asset, side, offer.get("id"), limit_price)
+            else:
+                record.verification_status = FillStatus.FILLED
+        else:
+            record.actual_filled_amount = amount
+            record.remaining_amount = 0.0
+            record.verification_status = FillStatus.FILLED
+    except BaseHorizonError as e:
+        log.error(f"{pair_label} could not verify fill status — "
+                  f"halting this pair rather than assuming a fill happened: {e}")
+        record.verification_status = FillStatus.UNCERTAIN
+        record.actual_filled_amount = 0.0
+
+    log.info(f"EXECUTION RECORD: {record}")
+    return record
+
+
+def process_pair(server, keypair, state: BotState, pair_state: PairState, my_generation: int):
+    counter_asset = pair_state.asset
+    label = f"XLM/{counter_asset.code}"
+
+    if pair_state.halted:
+        return
+
+    try:
+        price = get_mid_price(server, counter_asset)
+    except ValueError as e:
+        log.warning(f"[{label}] {e}")
+        return
+
+    pair_state.prices.append(price)
+
+    # Stop-loss check
+    if pair_state.position_open:
+        if pair_state.entry_price <= 0:
+            log.error(f"[{label}] position_open is True but entry_price is invalid "
+                      f"({pair_state.entry_price}) — halting rather than dividing by zero.")
+            pair_state.halted_reconciliation = True
+            pair_state.halt_reason = "entry_price was invalid (<=0) while position_open=True."
+            _persist_pair(pair_state)
+            return
+        loss_pct = (pair_state.entry_price - price) / pair_state.entry_price
+        if loss_pct >= STOP_LOSS_PCT:
+            record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
+            if state.cycle_generation != my_generation:
+                log.warning(f"[{label}] Stop-loss order finished after the watchdog had "
+                            f"already abandoned it — discarding this result rather than "
+                            f"writing stale state. Reconciliation will pick up the real "
+                            f"on-chain outcome next cycle.")
+                return
+            order_row_id = _persist_order_record(record, counter_asset)
+            if record.verification_status == FillStatus.UNCERTAIN:
+                pair_state.halted_reconciliation = True
+                pair_state.halt_reason = f"Stop-loss order status unverifiable (tx {record.transaction_hash})."
+                _persist_pair(pair_state)
+                log.error(f"[{label}] Stop-loss order status could not be verified. "
+                          f"Halting this pair for manual review rather than guessing.")
+                return
+            filled = record.actual_filled_amount
+            if filled > 0:
+                pnl = (price - pair_state.entry_price) * filled
+                pair_state.daily_pnl += pnl
+                state.total_daily_pnl += pnl
+                pair_state.position_size -= filled
+                if pair_state.position_size <= 1e-7:
+                    pair_state.position_open = False
+                    pair_state.entry_price = 0.0
+                    pair_state.entry_price_verified = False
+                _persist_trade_record(record, counter_asset, order_row_id, pnl)
+                _persist_pair(pair_state)
+                _persist_daily_risk(state)
+                log.warning(f"[{label}] Stop-loss hit ({loss_pct:.2%}). "
+                            f"Sold {filled:.4f}/position. PnL: {pnl:.2f}")
+            else:
+                log.warning(f"[{label}] Stop-loss triggered but order did not fill. Still holding position.")
+
+    if pair_state.daily_pnl <= -MAX_DAILY_LOSS_PER_PAIR:
+        log.warning(f"[{label}] Daily loss limit hit. Halting {label} for today.")
+        pair_state.halted_daily = True
+        _persist_pair(pair_state)
+        return
+
+    if state.total_daily_pnl <= -MAX_TOTAL_DAILY_LOSS:
+        log.warning("Total daily loss limit hit. Halting entire bot for today.")
+        state.globally_halted = True
+        _persist_daily_risk(state)
+        return
+
+    short_ma = moving_average(pair_state.prices, SHORT_WINDOW)
+    long_ma = moving_average(pair_state.prices, LONG_WINDOW)
+    rsi = compute_rsi(pair_state.prices, RSI_PERIOD)
+
+    if short_ma is None or long_ma is None or rsi is None:
+        log.info(f"[{label}] Warming up ({len(pair_state.prices)} samples) price={price:.6f}")
+        return
+
+    uptrend = short_ma > long_ma
+    oversold = rsi < RSI_OVERSOLD
+    overbought = rsi > RSI_OVERBOUGHT
+
+    log.info(f"[{label}] price={price:.6f} trend={'UP' if uptrend else 'DOWN'} "
+              f"rsi={rsi:.1f} position_open={pair_state.position_open}")
+
+    # BUY LOW: oversold dip, but only within an uptrend
+    if not pair_state.position_open and oversold and uptrend:
+        size = min(ORDER_SIZE, MAX_POSITION_SIZE / price)
+        record = submit_order(server, keypair, counter_asset, "buy", size, price)
+        if state.cycle_generation != my_generation:
+            log.warning(f"[{label}] BUY order finished after the watchdog had already "
+                        f"abandoned it — discarding this result rather than writing stale "
+                        f"state. Reconciliation will pick up the real on-chain outcome "
+                        f"next cycle.")
+            return
+        order_row_id = _persist_order_record(record, counter_asset)
+        if record.verification_status == FillStatus.UNCERTAIN:
+            pair_state.halted_reconciliation = True
+            pair_state.halt_reason = f"BUY order status unverifiable (tx {record.transaction_hash})."
+            _persist_pair(pair_state)
+            log.error(f"[{label}] BUY order status could not be verified. "
+                      f"Halting this pair for manual review rather than guessing.")
+            return
+        filled = record.actual_filled_amount
+        if filled > 0:
+            pair_state.position_open = True
+            pair_state.entry_price = price
+            pair_state.entry_price_verified = False  # approximation — see known execution-price gap
+            pair_state.position_size = filled
+            _persist_trade_record(record, counter_asset, order_row_id, None)
+            _persist_pair(pair_state)
+            log.info(f"[{label}] BUY (dip in uptrend, RSI={rsi:.1f}) — {filled:.4f} XLM at {price:.6f}")
+        else:
+            log.info(f"[{label}] BUY signal fired but order did not fill.")
+
+    # SELL HIGH: overbought, OR trend has flipped down (protect gains)
+    elif pair_state.position_open and (overbought or not uptrend):
+        reason = "overbought" if overbought else "trend flipped down"
+        record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
+        if state.cycle_generation != my_generation:
+            log.warning(f"[{label}] SELL order finished after the watchdog had already "
+                        f"abandoned it — discarding this result rather than writing stale "
+                        f"state. Reconciliation will pick up the real on-chain outcome "
+                        f"next cycle.")
+            return
+        order_row_id = _persist_order_record(record, counter_asset)
+        if record.verification_status == FillStatus.UNCERTAIN:
+            pair_state.halted_reconciliation = True
+            pair_state.halt_reason = f"SELL order status unverifiable (tx {record.transaction_hash})."
+            _persist_pair(pair_state)
+            log.error(f"[{label}] SELL order status could not be verified. "
+                      f"Halting this pair for manual review rather than guessing.")
+            return
+        filled = record.actual_filled_amount
+        if filled > 0:
+            pnl = (price - pair_state.entry_price) * filled
+            pair_state.daily_pnl += pnl
+            state.total_daily_pnl += pnl
+            pair_state.position_size -= filled
+            if pair_state.position_size <= 1e-7:
+                pair_state.position_open = False
+                pair_state.entry_price = 0.0
+                pair_state.entry_price_verified = False
+            _persist_trade_record(record, counter_asset, order_row_id, pnl)
+            _persist_pair(pair_state)
+            _persist_daily_risk(state)
+            log.info(f"[{label}] SELL ({reason}, RSI={rsi:.1f}) — sold {filled:.4f}. PnL: {pnl:.2f}")
+        else:
+            log.info(f"[{label}] SELL signal fired but order did not fill. Still holding position.")
+
+
+def run_bot():
+    if not DRY_RUN and not SECRET_KEY:
+        raise SystemExit("STELLAR_SECRET_KEY is required for live trading.")
+
+    if not DRY_RUN and not persistence.is_enabled():
+        raise SystemExit(
+            "SUPABASE_URL / SUPABASE_SERVICE_KEY are required before DRY_RUN can be turned "
+            "off. This bot refuses to trade live without a persistent bookkeeping layer to "
+            "reconcile against after a restart — see persistence.py."
+        )
+
+    server = Server(HORIZON_URLS[NETWORK])
+    keypair = Keypair.from_secret(SECRET_KEY) if SECRET_KEY else None
+    if not keypair:
+        raise SystemExit("STELLAR_SECRET_KEY is required even for dry runs "
+                          "(the bot reads pairs from your account).")
+
+    if not persistence.is_enabled():
+        log.warning("Supabase persistence is NOT configured (SUPABASE_URL / "
+                     "SUPABASE_SERVICE_KEY missing) — running with in-memory state only. "
+                     "Fine for DRY_RUN testing; required before going live.")
+    else:
+        log.info("Supabase persistence is configured — bookkeeping will be written every cycle.")
+
+    today_str = persistence.today()
+    persisted_risk = persistence.get_daily_risk(today_str)
+    state = BotState(
+        daily_pnl_date=today_str,
+        total_daily_pnl=float(persisted_risk.get("total_daily_pnl", 0)) if persisted_risk else 0.0,
+        globally_halted=bool(persisted_risk.get("globally_halted")) if persisted_risk else False,
+    )
+    _persist_daily_risk(state)
+
+    cycle_count = 0
+    mode = "DRY RUN" if DRY_RUN else f"LIVE ({NETWORK})"
+    log.info(f"Starting Stellar multi-pair bot (trend + RSI) — mode: {mode}")
+
+    while True:
+        try:
+            state.cycle_generation += 1
+            my_generation = state.cycle_generation
+            reset_daily_pnl_if_new_day(state)
+
+            if state.globally_halted:
+                log.warning("Globally halted for today. Sleeping...")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            if cycle_count % REFRESH_ASSETS_EVERY_N_CYCLES == 0:
+                discovery_started = time.monotonic()
+                ok, assets = _run_with_timeout(discover_tradable_assets, PER_CALL_TIMEOUT_SECONDS,
+                                                server, keypair.public_key)
+                if not ok:
+                    log.error(f"discover_tradable_assets timed out after "
+                              f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this cycle's asset "
+                              f"refresh (will retry next cycle).")
+                    assets = []
+
+                for asset, balance in assets:
+                    if time.monotonic() - discovery_started >= MAX_CYCLE_SECONDS:
+                        log.warning(f"Discovery/reconciliation deadline ({MAX_CYCLE_SECONDS}s) "
+                                    f"reached — remaining new assets deferred to the next "
+                                    f"discovery cycle.")
+                        break
+                    key = asset_key(asset)
+                    if key not in state.pairs:
+                        log.info(f"Discovered new asset: {asset.code} — adding to bot")
+                        ok2, pair_state_result = _run_with_timeout(
+                            reconcile_pair_on_startup, PER_CALL_TIMEOUT_SECONDS,
+                            server, keypair, asset, balance)
+                        if not ok2:
+                            log.error(f"XLM/{asset.code} reconciliation timed out after "
+                                      f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this asset for "
+                                      f"now, will retry next discovery cycle.")
+                            continue
+                        state.pairs[key] = pair_state_result
+
+                if not state.pairs:
+                    log.warning("No tradable (non-XLM) trustlines found yet in this account.")
+
+            cycle_started = time.monotonic()
+            for pair_state in list(state.pairs.values()):
+                if time.monotonic() - cycle_started >= MAX_CYCLE_SECONDS:
+                    log.warning(f"Cycle deadline ({MAX_CYCLE_SECONDS}s) reached — remaining "
+                                f"pairs deferred to the next cycle.")
+                    break
+                try:
+                    ok3, _ = _run_with_timeout(process_pair, PER_CALL_TIMEOUT_SECONDS,
+                                                server, keypair, state, pair_state, my_generation)
+                    if not ok3:
+                        log.error(f"[{pair_state.asset.code}] process_pair timed out after "
+                                  f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this pair this cycle.")
+                except BaseHorizonError as e:
+                    log.error(f"[{pair_state.asset.code}] Horizon API error: {e}")
+                except Exception as e:
+                    log.exception(f"[{pair_state.asset.code}] Unexpected error: {e}")
+
+            cycle_count += 1
+
+        except BaseHorizonError
+
