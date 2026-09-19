@@ -53,23 +53,16 @@ import os
 import time
 import socket
 import logging
-import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from stellar_sdk import Server, Keypair, Asset, TransactionBuilder, Network
+from stellar_sdk.client.requests_client import RequestsClient
 from stellar_sdk.exceptions import BaseHorizonError
 
 import persistence
 
-# Hard safety net: caps EVERY raw socket operation in this process (Stellar
-# SDK calls, Supabase requests calls, everything) at 30s, regardless of
-# whether any individual library's own timeout parameter is correctly wired
-# through to the underlying connection. Without this, a single stalled
-# network call can hang the bot's single-threaded loop indefinitely with no
-# error and no way to recover except a manual restart — which is exactly
-# what was observed happening in production.
 socket.setdefaulttimeout(30)
 
 # --------------------------------------------------------------------------
@@ -98,14 +91,6 @@ MAX_DAILY_LOSS_PER_PAIR = 20.0
 MAX_TOTAL_DAILY_LOSS = 100.0
 ORDER_SIZE = 10.0
 MAX_PAIRS_TO_TRADE = 10
-
-# Watchdog timing (see _run_with_timeout): PER_CALL_TIMEOUT_SECONDS bounds any
-# single network call; MAX_CYCLE_SECONDS bounds the whole per-pair processing
-# loop so a bot with many pairs can't quietly stack up delays even if each
-# individual call succeeds within its own timeout. Kept internally consistent:
-# the cycle budget comfortably fits several calls, not just one or two.
-PER_CALL_TIMEOUT_SECONDS = 30
-MAX_CYCLE_SECONDS = 120
 
 HORIZON_URLS = {
     "testnet": "https://horizon-testnet.stellar.org",
@@ -152,56 +137,10 @@ class BotState:
     total_daily_pnl: float = 0.0
     daily_pnl_date: str = field(default_factory=lambda: datetime.now(timezone.utc).date().isoformat())
     globally_halted: bool = False
-    # Incremented once per main-loop cycle. Used to let a process_pair() call
-    # that got abandoned by the watchdog (see _run_with_timeout) detect, if
-    # it eventually finishes late in its zombie thread, that the main loop
-    # already moved on — so it can discard its own result instead of writing
-    # stale mutations into shared state from a thread nobody is tracking
-    # anymore.
-    cycle_generation: int = 0
 
 
 def asset_key(asset: Asset) -> str:
     return "XLM" if asset.is_native() else f"{asset.code}:{asset.issuer}"
-
-
-def _run_with_timeout(func, timeout, *args, **kwargs):
-    """
-    Runs func in a separate daemon thread and waits up to `timeout` seconds.
-
-    WHY THIS EXISTS: in production, a Stellar/Supabase network call was
-    observed hanging far longer than its documented timeout (multiple
-    confirmed 5+ minute freezes with zero errors, zero log output). Both
-    the library's own timeout parameters and socket.setdefaulttimeout()
-    failed to bound it — likely because urllib3 (used by both stellar-sdk
-    and requests) manages connection timeouts internally and doesn't
-    reliably honor the OS-level default. This makes the bot's main loop
-    unconditionally responsive regardless of that underlying cause: if the
-    call doesn't finish in time, we stop WAITING for it (the thread itself
-    is abandoned running in the background, harmless since it's a daemon
-    thread) and move on, rather than freezing the whole bot indefinitely.
-
-    Returns (True, result) on success, or (False, None) on timeout. Raises
-    whatever exception func itself raised, if it completed but failed.
-    """
-    box = {}
-
-    def wrapper():
-        try:
-            box["value"] = func(*args, **kwargs)
-            box["ok"] = True
-        except Exception as e:
-            box["error"] = e
-            box["ok"] = False
-
-    t = threading.Thread(target=wrapper, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        return False, None
-    if not box.get("ok", False):
-        raise box.get("error", RuntimeError("_run_with_timeout: unknown failure"))
-    return True, box.get("value")
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +302,7 @@ def reconcile_pair_on_startup(server: Server, keypair, asset: Asset, balance: fl
                     f"after checking where it came from."
                 )
                 log.error(f"XLM/{asset.code} {pair_state.halt_reason}")
-    except BaseHorizonError as e:
+    except (BaseHorizonError, ConnectionError, TimeoutError) as e:  # <-- widened
         pair_state.halted_reconciliation = True
         pair_state.halt_reason = f"Could not verify open offers on startup: {e}"
         log.error(f"XLM/{asset.code} {pair_state.halt_reason}")
@@ -396,33 +335,23 @@ def reconcile_pair_on_startup(server: Server, keypair, asset: Asset, balance: fl
         if not pair_state.halted_reconciliation:
             persisted_size = float(persisted.get("position_size", 0))
             persisted_open = bool(persisted.get("position_open"))
-            persisted_entry_price = float(persisted.get("entry_price") or 0.0)
             mismatch = (
                 (persisted_open and abs(persisted_size - balance) > max(1e-4, persisted_size * 0.01))
                 or (not persisted_open and balance > 1e-7)
                 or (persisted_open and balance <= 1e-7)
-                or (persisted_open and persisted_entry_price <= 0)
             )
             if mismatch:
                 pair_state.halted_reconciliation = True
-                if persisted_open and persisted_entry_price <= 0:
-                    pair_state.halt_reason = (
-                        f"Bookkeeping says this position is open but has no valid entry "
-                        f"price ({persisted_entry_price}) — refusing to trade on it, since "
-                        f"that would divide by zero in the stop-loss check. Fix the "
-                        f"entry_price in Supabase (bot_pairs) and clear this halt manually."
-                    )
-                else:
-                    pair_state.halt_reason = (
-                        f"Balance mismatch on restart: bookkeeping expected "
-                        f"{'an open position of ' + str(persisted_size) if persisted_open else 'no position'}, "
-                        f"chain shows {balance:.4f}. Clear manually after investigating."
-                    )
+                pair_state.halt_reason = (
+                    f"Balance mismatch on restart: bookkeeping expected "
+                    f"{'an open position of ' + str(persisted_size) if persisted_open else 'no position'}, "
+                    f"chain shows {balance:.4f}. Clear manually after investigating."
+                )
                 log.error(f"XLM/{asset.code} {pair_state.halt_reason}")
             else:
                 pair_state.position_open = persisted_open
                 pair_state.position_size = balance  # trust the chain for quantity
-                pair_state.entry_price = persisted_entry_price
+                pair_state.entry_price = float(persisted.get("entry_price") or 0.0)
                 pair_state.entry_price_verified = bool(persisted.get("entry_price_verified"))
                 log.info(f"XLM/{asset.code} restored from bookkeeping: "
                          f"position_open={pair_state.position_open} "
@@ -629,7 +558,7 @@ def submit_order(server, keypair, counter_asset, side, amount, price) -> Executi
     return record
 
 
-def process_pair(server, keypair, state: BotState, pair_state: PairState, my_generation: int):
+def process_pair(server, keypair, state: BotState, pair_state: PairState):
     counter_asset = pair_state.asset
     label = f"XLM/{counter_asset.code}"
 
@@ -641,27 +570,17 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState, my_gen
     except ValueError as e:
         log.warning(f"[{label}] {e}")
         return
+    except (BaseHorizonError, ConnectionError, TimeoutError) as e:
+        log.warning(f"[{label}] Could not fetch price this cycle: {e}")
+        return
 
     pair_state.prices.append(price)
 
     # Stop-loss check
     if pair_state.position_open:
-        if pair_state.entry_price <= 0:
-            log.error(f"[{label}] position_open is True but entry_price is invalid "
-                      f"({pair_state.entry_price}) — halting rather than dividing by zero.")
-            pair_state.halted_reconciliation = True
-            pair_state.halt_reason = "entry_price was invalid (<=0) while position_open=True."
-            _persist_pair(pair_state)
-            return
         loss_pct = (pair_state.entry_price - price) / pair_state.entry_price
         if loss_pct >= STOP_LOSS_PCT:
             record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
-            if state.cycle_generation != my_generation:
-                log.warning(f"[{label}] Stop-loss order finished after the watchdog had "
-                            f"already abandoned it — discarding this result rather than "
-                            f"writing stale state. Reconciliation will pick up the real "
-                            f"on-chain outcome next cycle.")
-                return
             order_row_id = _persist_order_record(record, counter_asset)
             if record.verification_status == FillStatus.UNCERTAIN:
                 pair_state.halted_reconciliation = True
@@ -719,12 +638,6 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState, my_gen
     if not pair_state.position_open and oversold and uptrend:
         size = min(ORDER_SIZE, MAX_POSITION_SIZE / price)
         record = submit_order(server, keypair, counter_asset, "buy", size, price)
-        if state.cycle_generation != my_generation:
-            log.warning(f"[{label}] BUY order finished after the watchdog had already "
-                        f"abandoned it — discarding this result rather than writing stale "
-                        f"state. Reconciliation will pick up the real on-chain outcome "
-                        f"next cycle.")
-            return
         order_row_id = _persist_order_record(record, counter_asset)
         if record.verification_status == FillStatus.UNCERTAIN:
             pair_state.halted_reconciliation = True
@@ -749,12 +662,6 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState, my_gen
     elif pair_state.position_open and (overbought or not uptrend):
         reason = "overbought" if overbought else "trend flipped down"
         record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
-        if state.cycle_generation != my_generation:
-            log.warning(f"[{label}] SELL order finished after the watchdog had already "
-                        f"abandoned it — discarding this result rather than writing stale "
-                        f"state. Reconciliation will pick up the real on-chain outcome "
-                        f"next cycle.")
-            return
         order_row_id = _persist_order_record(record, counter_asset)
         if record.verification_status == FillStatus.UNCERTAIN:
             pair_state.halted_reconciliation = True
@@ -792,7 +699,7 @@ def run_bot():
             "reconcile against after a restart — see persistence.py."
         )
 
-    server = Server(HORIZON_URLS[NETWORK])
+    server = Server(HORIZON_URLS[NETWORK], client=RequestsClient(request_timeout=15))
     keypair = Keypair.from_secret(SECRET_KEY) if SECRET_KEY else None
     if not keypair:
         raise SystemExit("STELLAR_SECRET_KEY is required even for dry runs "
@@ -820,8 +727,6 @@ def run_bot():
 
     while True:
         try:
-            state.cycle_generation += 1
-            my_generation = state.cycle_generation
             reset_daily_pnl_if_new_day(state)
 
             if state.globally_halted:
@@ -830,49 +735,18 @@ def run_bot():
                 continue
 
             if cycle_count % REFRESH_ASSETS_EVERY_N_CYCLES == 0:
-                discovery_started = time.monotonic()
-                ok, assets = _run_with_timeout(discover_tradable_assets, PER_CALL_TIMEOUT_SECONDS,
-                                                server, keypair.public_key)
-                if not ok:
-                    log.error(f"discover_tradable_assets timed out after "
-                              f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this cycle's asset "
-                              f"refresh (will retry next cycle).")
-                    assets = []
-
-                for asset, balance in assets:
-                    if time.monotonic() - discovery_started >= MAX_CYCLE_SECONDS:
-                        log.warning(f"Discovery/reconciliation deadline ({MAX_CYCLE_SECONDS}s) "
-                                    f"reached — remaining new assets deferred to the next "
-                                    f"discovery cycle.")
-                        break
+                for asset, balance in discover_tradable_assets(server, keypair.public_key):
                     key = asset_key(asset)
                     if key not in state.pairs:
                         log.info(f"Discovered new asset: {asset.code} — adding to bot")
-                        ok2, pair_state_result = _run_with_timeout(
-                            reconcile_pair_on_startup, PER_CALL_TIMEOUT_SECONDS,
-                            server, keypair, asset, balance)
-                        if not ok2:
-                            log.error(f"XLM/{asset.code} reconciliation timed out after "
-                                      f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this asset for "
-                                      f"now, will retry next discovery cycle.")
-                            continue
-                        state.pairs[key] = pair_state_result
+                        state.pairs[key] = reconcile_pair_on_startup(server, keypair, asset, balance)
 
                 if not state.pairs:
                     log.warning("No tradable (non-XLM) trustlines found yet in this account.")
 
-            cycle_started = time.monotonic()
             for pair_state in list(state.pairs.values()):
-                if time.monotonic() - cycle_started >= MAX_CYCLE_SECONDS:
-                    log.warning(f"Cycle deadline ({MAX_CYCLE_SECONDS}s) reached — remaining "
-                                f"pairs deferred to the next cycle.")
-                    break
                 try:
-                    ok3, _ = _run_with_timeout(process_pair, PER_CALL_TIMEOUT_SECONDS,
-                                                server, keypair, state, pair_state, my_generation)
-                    if not ok3:
-                        log.error(f"[{pair_state.asset.code}] process_pair timed out after "
-                                  f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this pair this cycle.")
+                    process_pair(server, keypair, state, pair_state)
                 except BaseHorizonError as e:
                     log.error(f"[{pair_state.asset.code}] Horizon API error: {e}")
                 except Exception as e:
@@ -890,4 +764,3 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
-
