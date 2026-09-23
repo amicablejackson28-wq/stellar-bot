@@ -53,6 +53,7 @@ import os
 import time
 import socket
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -64,6 +65,56 @@ from stellar_sdk.exceptions import BaseHorizonError
 import persistence
 
 socket.setdefaulttimeout(30)
+
+# --------------------------------------------------------------------------
+# WATCHDOG
+# --------------------------------------------------------------------------
+# The 15s RequestsClient timeout and socket.setdefaulttimeout(30) above are
+# real, but neither is a hard guarantee against every kind of hang (DNS
+# resolution, certain connection-pool states, or a library that manages its
+# own timeouts internally can all still block past those limits). This
+# watchdog is the actual backstop: it runs the call in a daemon thread and
+# gives up waiting after PER_CALL_TIMEOUT_SECONDS, even if the thread itself
+# never returns. The abandoned thread is not killed (Python can't force-kill
+# a thread) — cycle_generation fencing in process_pair is what prevents an
+# abandoned thread's late result from being written into shared state.
+
+PER_CALL_TIMEOUT_SECONDS = 30
+MAX_CYCLE_SECONDS = 120
+
+
+def _run_with_timeout(func, timeout_seconds, *args, **kwargs):
+    """
+    Runs func(*args, **kwargs) in a daemon thread. Returns (True, result) if
+    it finished within timeout_seconds, or (False, None) if the deadline
+    passed — in which case the thread is abandoned (not killed) and may
+    still complete and mutate shared state later; callers that touch shared
+    state must guard against that (see cycle_generation in process_pair).
+    """
+    result_box = {}
+
+    def _target():
+        try:
+            result_box["value"] = func(*args, **kwargs)
+            result_box["ok"] = True
+        except Exception as e:
+            result_box["error"] = e
+            result_box["ok"] = False
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        return False, None
+
+    if result_box.get("ok"):
+        return True, result_box.get("value")
+    else:
+        # The call finished but raised — re-raise on the calling thread so
+        # existing except BaseHorizonError / except Exception blocks upstream
+        # still work as before.
+        raise result_box["error"]
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -137,6 +188,7 @@ class BotState:
     total_daily_pnl: float = 0.0
     daily_pnl_date: str = field(default_factory=lambda: datetime.now(timezone.utc).date().isoformat())
     globally_halted: bool = False
+    cycle_generation: int = 0  # incremented once per main-loop iteration; see process_pair
 
 
 def asset_key(asset: Asset) -> str:
@@ -431,7 +483,7 @@ class ExecutionRecord:
     Full audit record for one submitted order. Anything we can't actually
     verify is left as None rather than backfilled with an approximation —
     a None here is a known gap, not a silent guess.
-    """
+      """
     transaction_hash: str | None
     pair: str
     side: str
@@ -558,7 +610,7 @@ def submit_order(server, keypair, counter_asset, side, amount, price) -> Executi
     return record
 
 
-def process_pair(server, keypair, state: BotState, pair_state: PairState):
+def process_pair(server, keypair, state: BotState, pair_state: PairState, my_generation: int):
     counter_asset = pair_state.asset
     label = f"XLM/{counter_asset.code}"
 
@@ -578,9 +630,22 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState):
 
     # Stop-loss check
     if pair_state.position_open:
+        if pair_state.entry_price <= 0:
+            log.error(f"[{label}] position_open is True but entry_price is invalid "
+                      f"({pair_state.entry_price}) — halting rather than dividing by zero.")
+            pair_state.halted_reconciliation = True
+            pair_state.halt_reason = "entry_price was invalid (<=0) while position_open=True."
+            _persist_pair(pair_state)
+            return
         loss_pct = (pair_state.entry_price - price) / pair_state.entry_price
         if loss_pct >= STOP_LOSS_PCT:
             record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
+            if state.cycle_generation != my_generation:
+                log.warning(f"[{label}] Stop-loss order finished after the watchdog had "
+                            f"already abandoned it — discarding this result rather than "
+                            f"writing stale state. Reconciliation will pick up the real "
+                            f"on-chain outcome next cycle.")
+                return
             order_row_id = _persist_order_record(record, counter_asset)
             if record.verification_status == FillStatus.UNCERTAIN:
                 pair_state.halted_reconciliation = True
@@ -638,6 +703,12 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState):
     if not pair_state.position_open and oversold and uptrend:
         size = min(ORDER_SIZE, MAX_POSITION_SIZE / price)
         record = submit_order(server, keypair, counter_asset, "buy", size, price)
+        if state.cycle_generation != my_generation:
+            log.warning(f"[{label}] BUY order finished after the watchdog had already "
+                        f"abandoned it — discarding this result rather than writing stale "
+                        f"state. Reconciliation will pick up the real on-chain outcome "
+                        f"next cycle.")
+            return
         order_row_id = _persist_order_record(record, counter_asset)
         if record.verification_status == FillStatus.UNCERTAIN:
             pair_state.halted_reconciliation = True
@@ -662,6 +733,12 @@ def process_pair(server, keypair, state: BotState, pair_state: PairState):
     elif pair_state.position_open and (overbought or not uptrend):
         reason = "overbought" if overbought else "trend flipped down"
         record = submit_order(server, keypair, counter_asset, "sell", pair_state.position_size, price)
+        if state.cycle_generation != my_generation:
+            log.warning(f"[{label}] SELL order finished after the watchdog had already "
+                        f"abandoned it — discarding this result rather than writing stale "
+                        f"state. Reconciliation will pick up the real on-chain outcome "
+                        f"next cycle.")
+            return
         order_row_id = _persist_order_record(record, counter_asset)
         if record.verification_status == FillStatus.UNCERTAIN:
             pair_state.halted_reconciliation = True
@@ -727,6 +804,8 @@ def run_bot():
 
     while True:
         try:
+            state.cycle_generation += 1
+            my_generation = state.cycle_generation
             reset_daily_pnl_if_new_day(state)
 
             if state.globally_halted:
@@ -735,18 +814,49 @@ def run_bot():
                 continue
 
             if cycle_count % REFRESH_ASSETS_EVERY_N_CYCLES == 0:
-                for asset, balance in discover_tradable_assets(server, keypair.public_key):
+                discovery_started = time.monotonic()
+                ok, assets = _run_with_timeout(discover_tradable_assets, PER_CALL_TIMEOUT_SECONDS,
+                                                server, keypair.public_key)
+                if not ok:
+                    log.error(f"discover_tradable_assets timed out after "
+                              f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this cycle's asset "
+                              f"refresh (will retry next cycle).")
+                    assets = []
+
+                for asset, balance in assets:
+                    if time.monotonic() - discovery_started >= MAX_CYCLE_SECONDS:
+                        log.warning(f"Discovery/reconciliation deadline ({MAX_CYCLE_SECONDS}s) "
+                                    f"reached — remaining new assets deferred to the next "
+                                    f"discovery cycle.")
+                        break
                     key = asset_key(asset)
                     if key not in state.pairs:
                         log.info(f"Discovered new asset: {asset.code} — adding to bot")
-                        state.pairs[key] = reconcile_pair_on_startup(server, keypair, asset, balance)
+                        ok2, pair_state_result = _run_with_timeout(
+                            reconcile_pair_on_startup, PER_CALL_TIMEOUT_SECONDS,
+                            server, keypair, asset, balance)
+                        if not ok2:
+                            log.error(f"XLM/{asset.code} reconciliation timed out after "
+                                      f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this asset for "
+                                      f"now, will retry next discovery cycle.")
+                            continue
+                        state.pairs[key] = pair_state_result
 
                 if not state.pairs:
                     log.warning("No tradable (non-XLM) trustlines found yet in this account.")
 
+            cycle_started = time.monotonic()
             for pair_state in list(state.pairs.values()):
+                if time.monotonic() - cycle_started >= MAX_CYCLE_SECONDS:
+                    log.warning(f"Cycle deadline ({MAX_CYCLE_SECONDS}s) reached — remaining "
+                                f"pairs deferred to the next cycle.")
+                    break
                 try:
-                    process_pair(server, keypair, state, pair_state)
+                    ok3, _ = _run_with_timeout(process_pair, PER_CALL_TIMEOUT_SECONDS,
+                                                server, keypair, state, pair_state, my_generation)
+                    if not ok3:
+                        log.error(f"[{pair_state.asset.code}] process_pair timed out after "
+                                  f"{PER_CALL_TIMEOUT_SECONDS}s — skipping this pair this cycle.")
                 except BaseHorizonError as e:
                     log.error(f"[{pair_state.asset.code}] Horizon API error: {e}")
                 except Exception as e:
